@@ -1,0 +1,10 @@
+bin/
+build/bin/
+.gocache/
+frontend/node_modules/
+frontend/.vite/
+.env
+.env.*
+*.exe
+*.test
+*.log
