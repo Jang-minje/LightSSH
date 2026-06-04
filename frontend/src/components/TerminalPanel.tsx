@@ -289,6 +289,8 @@ export function TerminalPanel({
         }
         if (selection.trim()) {
           onCopyRef.current(selection);
+          terminalRef.current?.clearSelection();
+          terminalRef.current?.focus();
           return;
         }
         pasteFromClipboard();
