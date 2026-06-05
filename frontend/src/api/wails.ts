@@ -91,6 +91,14 @@ export async function writeClipboardText(text: string): Promise<boolean> {
   return legacyCopyText(text);
 }
 
+export async function appendAppLog(line: string): Promise<void> {
+  await optionalApp()?.AppendAppLog(line);
+}
+
+export async function revealAppLogFile(): Promise<void> {
+  return app().RevealAppLogFile();
+}
+
 function legacyCopyText(text: string): boolean {
   const textarea = document.createElement("textarea");
   textarea.value = text;
@@ -163,6 +171,8 @@ export type WailsApp = {
   StartReverseTunnel(request: StartReverseTunnelRequest): Promise<TunnelInfo>;
   StopLocalTunnel(tunnelId: string): Promise<void>;
   ListTunnels(): Promise<TunnelInfo[]>;
+  AppendAppLog(line: string): Promise<void>;
+  RevealAppLogFile(): Promise<void>;
 };
 
 type WailsRuntime = {

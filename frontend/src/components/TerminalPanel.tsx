@@ -15,6 +15,7 @@ type TerminalPanelProps = {
   onData: (data: string) => void;
   onContextMenu: (x: number, y: number, selection: string) => void;
   onCopy: (selection: string) => void;
+  onDiagnostic: (message: string) => void;
   onFileDrop: (path: string) => void;
   onPaste: () => void;
   onResize: (columns: number, rows: number) => void;
@@ -32,6 +33,7 @@ export function TerminalPanel({
   onData,
   onContextMenu,
   onCopy,
+  onDiagnostic,
   onFileDrop,
   onPaste,
   onResize,
@@ -44,6 +46,7 @@ export function TerminalPanel({
   const disabledRef = useRef(disabled);
   const onDataRef = useRef(onData);
   const onCopyRef = useRef(onCopy);
+  const onDiagnosticRef = useRef(onDiagnostic);
   const onPasteRef = useRef(onPaste);
   const onResizeRef = useRef(onResize);
   const onZoomRef = useRef(onZoom);
@@ -58,11 +61,12 @@ export function TerminalPanel({
   useEffect(() => {
     onDataRef.current = onData;
     onCopyRef.current = onCopy;
+    onDiagnosticRef.current = onDiagnostic;
     onPasteRef.current = onPaste;
     onResizeRef.current = onResize;
     onZoomRef.current = onZoom;
     registerWriterRef.current = registerWriter;
-  }, [onCopy, onData, onPaste, onResize, onZoom, registerWriter]);
+  }, [onCopy, onData, onDiagnostic, onPaste, onResize, onZoom, registerWriter]);
 
   const emitFileDrop = useCallback(
     (path: string) => {
@@ -94,6 +98,9 @@ export function TerminalPanel({
   const copySelection = useCallback(() => {
     const selection = liveSelection();
     if (selection.trim()) {
+      onDiagnosticRef.current(
+        `keyboard copy requested, selectionLength=${selection.length}`,
+      );
       onCopyRef.current(selection);
       return true;
     }
@@ -210,6 +217,7 @@ export function TerminalPanel({
     };
     const handlePaste = (event: ClipboardEvent) => {
       const text = event.clipboardData?.getData("text/plain") ?? "";
+      onDiagnosticRef.current(`dom paste event, textLength=${text.length}`);
       if (pasteText(text)) {
         event.preventDefault();
         event.stopPropagation();
@@ -223,6 +231,9 @@ export function TerminalPanel({
       event.clipboardData?.setData("text/plain", selection);
       event.preventDefault();
       event.stopPropagation();
+      onDiagnosticRef.current(
+        `dom copy event handled, selectionLength=${selection.length}`,
+      );
       onCopyRef.current(selection);
     };
     container.addEventListener("keydown", handleKeyDown, { capture: true });
@@ -276,6 +287,9 @@ export function TerminalPanel({
           return;
         }
         rightClickSelectionRef.current = liveSelection();
+        onDiagnosticRef.current(
+          `right pointer down, selectionLength=${rightClickSelectionRef.current.length}`,
+        );
         terminalRef.current?.focus();
       }}
       onContextMenu={(event) => {
@@ -283,16 +297,24 @@ export function TerminalPanel({
         terminalRef.current?.focus();
         const selection = rightClickSelectionRef.current || liveSelection();
         rightClickSelectionRef.current = "";
+        onDiagnosticRef.current(
+          `context menu event, shift=${event.shiftKey}, selectionLength=${selection.length}`,
+        );
         if (event.shiftKey) {
+          onDiagnosticRef.current("opening terminal context menu");
           onContextMenu(event.clientX, event.clientY, selection);
           return;
         }
         if (selection.trim()) {
+          onDiagnosticRef.current(
+            `right-click copy requested, selectionLength=${selection.length}`,
+          );
           onCopyRef.current(selection);
           terminalRef.current?.clearSelection();
           terminalRef.current?.focus();
           return;
         }
+        onDiagnosticRef.current("right-click paste requested");
         pasteFromClipboard();
       }}
       onDragOverCapture={(event) => {

@@ -60,7 +60,13 @@ import {
   saveAppearanceSettings,
   type AppearanceSettings,
 } from "../api/settings";
-import { readClipboardText, writeClipboardText } from "../api/wails";
+import { onTunnelEvent } from "../api/tunnel";
+import {
+  appendAppLog,
+  readClipboardText,
+  revealAppLogFile,
+  writeClipboardText,
+} from "../api/wails";
 
 const emptyProfile: ConnectionProfile = {
   id: "manual",
@@ -118,6 +124,16 @@ type TransferMetrics = {
   startedAt: number;
 };
 
+type ActiveView = "terminal" | "tunnel" | "log";
+
+type AppLogEntry = {
+  id: string;
+  at: string;
+  level: "info" | "warn" | "error";
+  source: "ssh" | "sftp" | "tunnel" | "terminal" | "clipboard" | "app";
+  message: string;
+};
+
 export function HomePage() {
   const [profiles, setProfiles] = useState<ConnectionProfile[]>([]);
   const [profile, setProfile] = useState<ConnectionProfile>(emptyProfile);
@@ -132,9 +148,7 @@ export function HomePage() {
   const [leftPanelWidth, setLeftPanelWidth] = useState(280);
   const [rightPanelCollapsed, setRightPanelCollapsed] = useState(false);
   const [rightPanelWidth, setRightPanelWidth] = useState(220);
-  const [activeView, setActiveView] = useState<"terminal" | "tunnel">(
-    "terminal",
-  );
+  const [activeView, setActiveView] = useState<ActiveView>("terminal");
   const [status, setStatus] = useState("연결 안 됨");
   const [error, setError] = useState("");
   const [hostKeyPrompt, setHostKeyPrompt] = useState<HostKeyPrompt | null>(null);
@@ -159,6 +173,7 @@ export function HomePage() {
   const [transferMetrics, setTransferMetrics] = useState<
     Record<string, TransferMetrics>
   >({});
+  const [logs, setLogs] = useState<AppLogEntry[]>([]);
 
   const terminalTabsRef = useRef<TerminalTab[]>([]);
   const writerRefs = useRef(new Map<string, (data: string) => void>());
@@ -172,6 +187,46 @@ export function HomePage() {
     () => terminalTabs.find((tab) => tab.id === activeTabId) ?? null,
     [activeTabId, terminalTabs],
   );
+
+  const appendLog = useCallback(
+    (
+      level: AppLogEntry["level"],
+      source: AppLogEntry["source"],
+      message: string,
+    ) => {
+      const entry = {
+        id: crypto.randomUUID(),
+        at: formatLogTimestamp(new Date()),
+        level,
+        source,
+        message: sanitizeLogMessage(message),
+      };
+      appendAppLog(formatLogEntry(entry)).catch(() => undefined);
+      setLogs((current) => {
+        const next = [...current, entry];
+        return next.slice(-500);
+      });
+    },
+    [],
+  );
+
+  const copyLogs = useCallback(async () => {
+    try {
+      await writeClipboardText(formatLogEntries(logs));
+      setStatus("로그를 클립보드에 복사했습니다.");
+    } catch (err: unknown) {
+      setError(errorMessage(err));
+    }
+  }, [logs]);
+
+  const revealLogs = useCallback(async () => {
+    try {
+      await revealAppLogFile();
+      setStatus("로그 파일 위치를 열었습니다.");
+    } catch (err: unknown) {
+      setError(errorMessage(err));
+    }
+  }, []);
 
   useEffect(() => {
     terminalTabsRef.current = terminalTabs;
@@ -219,12 +274,26 @@ export function HomePage() {
 
   useEffect(() => {
     return onHostKeyPrompt((prompt) => {
+      appendLog(
+        "warn",
+        "ssh",
+        `host key confirmation required for ${prompt.host} (${prompt.address})`,
+      );
       setHostKeyPrompt(prompt);
     });
-  }, []);
+  }, [appendLog]);
 
   useEffect(() => {
     return onSFTPProgress((event) => {
+      if (event.status !== "in_progress") {
+        appendLog(
+          event.status === "failed" ? "error" : "info",
+          "sftp",
+          `${event.direction} ${event.status}, transferId=${event.transferId}, mode=${
+            event.transferId.startsWith("terminal:") ? "terminal" : "sftp"
+          }, bytes=${event.bytes}/${event.total}`,
+        );
+      }
       const now = Date.now();
       setTransferMetrics((current) => {
         const previous = current[event.transferId];
@@ -304,7 +373,7 @@ export function HomePage() {
         }, 8000);
       }
     });
-  }, [remoteDownload?.sessionId]);
+  }, [appendLog, remoteDownload?.sessionId]);
 
   const writeToTab = useCallback((tabId: string, data: string) => {
     const writer = writerRefs.current.get(tabId);
@@ -325,6 +394,7 @@ export function HomePage() {
       }
     });
     const offError = onSSHError((event) => {
+      appendLog("error", "ssh", `session error, sessionId=${event.sessionId}: ${event.message}`);
       const tabId = sessionToTabRef.current.get(event.sessionId);
       if (tabId) {
         setTerminalTabs((current) =>
@@ -338,6 +408,7 @@ export function HomePage() {
       setError(event.message);
     });
     const offClosed = onSSHClosed((event) => {
+      appendLog("info", "ssh", `session closed, sessionId=${event.sessionId}: ${event.message}`);
       const tabId = sessionToTabRef.current.get(event.sessionId);
       if (tabId) {
         sessionToTabRef.current.delete(event.sessionId);
@@ -362,7 +433,19 @@ export function HomePage() {
       offError();
       offClosed();
     };
-  }, [writeToTab]);
+  }, [appendLog, writeToTab]);
+
+  useEffect(() => {
+    return onTunnelEvent((event) => {
+      appendLog(
+        event.status === "error" ? "error" : "info",
+        "tunnel",
+        `tunnel ${event.status}, id=${event.tunnelId}, connections=${event.connectionCount}${
+          event.message ? `, message=${event.message}` : ""
+        }`,
+      );
+    });
+  }, [appendLog]);
 
   useEffect(() => {
     if (!sessionKeepAlive) {
@@ -372,13 +455,21 @@ export function HomePage() {
       for (const tab of terminalTabsRef.current) {
         if (tab.sessionId && tab.status === "connected") {
           keepAliveSSHSession(tab.sessionId).catch((err: unknown) =>
-            setError(errorMessage(err)),
+            {
+              const message = errorMessage(err);
+              appendLog(
+                "error",
+                "ssh",
+                `keepalive failed, sessionId=${tab.sessionId}: ${message}`,
+              );
+              setError(message);
+            },
           );
         }
       }
     }, 60000);
     return () => window.clearInterval(timer);
-  }, [sessionKeepAlive]);
+  }, [appendLog, sessionKeepAlive]);
 
   useEffect(() => {
     if (!terminalMenu) {
@@ -425,7 +516,12 @@ export function HomePage() {
     setPassphrase("");
     setPasswordSaved(Boolean(savedProfile.passwordSaved));
     setStatus(`${savedProfile.name} 프로필 선택됨`);
-  }, []);
+    appendLog(
+      "info",
+      "app",
+      `profile selected, name=${savedProfile.name}, host=${savedProfile.host}:${savedProfile.port}, user=${savedProfile.username}`,
+    );
+  }, [appendLog]);
 
   const activateTerminalTab = useCallback((tab: TerminalTab) => {
     setActiveTabId(tab.id);
@@ -436,7 +532,12 @@ export function HomePage() {
     setPassphrase(tab.passphrase);
     setPasswordSaved(Boolean(tab.profile.passwordSaved));
     setStatus(`${tab.title} 터미널 선택됨`);
-  }, []);
+    appendLog(
+      "info",
+      "terminal",
+      `tab activated, title=${tab.title}, sessionId=${tab.sessionId ?? "none"}, status=${tab.status}`,
+    );
+  }, [appendLog]);
 
   const updateProfileDraft = useCallback(
     (changes: Partial<ConnectionProfile>) => {
@@ -462,6 +563,11 @@ export function HomePage() {
     const tabId = crypto.randomUUID();
     const tabProfile = { ...profile };
     const title = tabTitle(tabProfile);
+    appendLog(
+      "info",
+      "ssh",
+      `connect requested, title=${title}, host=${tabProfile.host}:${tabProfile.port}, user=${tabProfile.username}, auth=${tabProfile.authType}`,
+    );
     try {
       const session = await startSSHSession({
         profile: tabProfile,
@@ -492,32 +598,51 @@ export function HomePage() {
       setActiveView("terminal");
       setStatus("연결됨");
       writeToTab(tabId, "\r\nSSH 연결이 시작되었습니다.\r\n");
+      appendLog(
+        "info",
+        "ssh",
+        `connect succeeded, title=${title}, sessionId=${session.sessionId}`,
+      );
     } catch (err: unknown) {
       const message = errorMessage(err);
       if (message.includes("호스트 키 확인")) {
         setStatus("호스트 키 확인 대기");
         setError("");
+        appendLog("warn", "ssh", `connect paused for host key confirmation, title=${title}`);
         return;
       }
       setStatus("연결 실패");
       setError(message);
+      appendLog("error", "ssh", `connect failed, title=${title}: ${message}`);
     }
-  }, [passphrase, password, profile, writeToTab]);
+  }, [appendLog, passphrase, password, profile, writeToTab]);
 
   const disconnectActive = useCallback(async () => {
     if (!activeTab?.sessionId) {
       return;
     }
     try {
+      appendLog(
+        "info",
+        "ssh",
+        `disconnect requested, title=${activeTab.title}, sessionId=${activeTab.sessionId}`,
+      );
       await disconnectSSHSession(activeTab.sessionId);
     } catch (err: unknown) {
-      setError(errorMessage(err));
+      const message = errorMessage(err);
+      appendLog("error", "ssh", `disconnect failed: ${message}`);
+      setError(message);
     }
-  }, [activeTab]);
+  }, [activeTab, appendLog]);
 
   const closeTab = useCallback(
     async (tab: TerminalTab) => {
       if (tab.sessionId) {
+        appendLog(
+          "info",
+          "terminal",
+          `tab close requested, title=${tab.title}, sessionId=${tab.sessionId}`,
+        );
         await disconnectSSHSession(tab.sessionId).catch(() => undefined);
         sessionToTabRef.current.delete(tab.sessionId);
       }
@@ -540,45 +665,72 @@ export function HomePage() {
         return next;
       });
     },
-    [activeTabId],
+    [activeTabId, appendLog],
   );
 
   const sendInput = useCallback((tab: TerminalTab, data: string) => {
     if (!tab.sessionId) {
       return;
     }
-    sendSSHInput(tab.sessionId, data).catch((err: unknown) =>
-      setError(errorMessage(err)),
-    );
-  }, []);
+    sendSSHInput(tab.sessionId, data).catch((err: unknown) => {
+      const message = errorMessage(err);
+      appendLog(
+        "error",
+        "ssh",
+        `send input failed, title=${tab.title}, sessionId=${tab.sessionId}: ${message}`,
+      );
+      setError(message);
+    });
+  }, [appendLog]);
 
   const copyTerminalSelection = useCallback(async (selection: string) => {
     if (!selection.trim()) {
+      appendLog("warn", "clipboard", "copy skipped, empty selection");
       return;
     }
     try {
       await writeClipboardText(selection);
       setStatus("클립보드에 복사됨");
+      appendLog(
+        "info",
+        "clipboard",
+        `copy succeeded, selectionLength=${selection.length}`,
+      );
     } catch (err: unknown) {
-      setError(errorMessage(err));
+      const message = errorMessage(err);
+      appendLog(
+        "error",
+        "clipboard",
+        `copy failed, selectionLength=${selection.length}: ${message}`,
+      );
+      setError(message);
     }
-  }, []);
+  }, [appendLog]);
 
   const pasteClipboardToTab = useCallback(async (tab: TerminalTab | null) => {
     if (!tab?.sessionId) {
+      appendLog("warn", "clipboard", "paste skipped, no active SSH session");
       return;
     }
     try {
       const text = await readClipboardText();
       if (!text) {
+        appendLog("warn", "clipboard", "paste skipped, clipboard is empty");
         return;
       }
       await sendSSHInput(tab.sessionId, normalizeTerminalPaste(text));
       setTerminalFocusKey((current) => current + 1);
+      appendLog(
+        "info",
+        "clipboard",
+        `paste sent, title=${tab.title}, textLength=${text.length}`,
+      );
     } catch (err: unknown) {
-      setError(errorMessage(err));
+      const message = errorMessage(err);
+      appendLog("error", "clipboard", `paste failed: ${message}`);
+      setError(message);
     }
-  }, []);
+  }, [appendLog]);
 
   const resizeTerminal = useCallback(
     (tabId: string, columns: number, rows: number) => {
@@ -653,6 +805,11 @@ export function HomePage() {
         remoteUploadPath,
         targetName ?? baseName(localPath),
       );
+      appendLog(
+        "info",
+        "sftp",
+        `upload requested, mode=${uploadTransferMode}, local=${baseName(localPath)}, remote=${remotePath}, overwrite=${overwrite}`,
+      );
       try {
         if (uploadTransferMode === "terminal") {
           if (!activeTab.sessionId) {
@@ -666,6 +823,11 @@ export function HomePage() {
             overwrite,
           });
           setStatus("현재 터미널 계정 기준으로 업로드 중");
+          appendLog(
+            "info",
+            "sftp",
+            `terminal upload started, title=${activeTab.title}, remote=${remotePath}`,
+          );
           setActiveView("terminal");
           return;
         }
@@ -685,8 +847,14 @@ export function HomePage() {
           remotePath,
           overwrite,
         });
+        appendLog(
+          "info",
+          "sftp",
+          `sftp upload started, sessionId=${session.sessionId}, remote=${remotePath}`,
+        );
         setActiveView("terminal");
       } catch (err: unknown) {
+        appendLog("error", "sftp", `upload failed before fallback: ${errorMessage(err)}`);
         if (activeTab.sessionId) {
           const retryWithTerminal = window.confirm(
             `SFTP 업로드에 실패했습니다.\n\n${errorMessage(err)}\n\n현재 터미널 계정 방식으로 재시도할까요?\n이 방식은 느릴 수 있습니다.`,
@@ -703,17 +871,24 @@ export function HomePage() {
               overwrite,
             });
             setStatus("SFTP 실패로 터미널 계정 기준 업로드 중");
+            appendLog(
+              "warn",
+              "sftp",
+              `fallback terminal upload started, title=${activeTab.title}, remote=${remotePath}`,
+            );
             setActiveView("terminal");
             return;
           } catch (fallbackErr: unknown) {
-            setError(errorMessage(fallbackErr));
+            const message = errorMessage(fallbackErr);
+            appendLog("error", "sftp", `fallback terminal upload failed: ${message}`);
+            setError(message);
             return;
           }
         }
         setError(errorMessage(err));
       }
     },
-    [activeTab, remoteUploadPath, uploadTransferMode],
+    [activeTab, appendLog, remoteUploadPath, uploadTransferMode],
   );
 
   const handleTerminalFileDrop = useCallback(
@@ -721,6 +896,11 @@ export function HomePage() {
       setActiveView("terminal");
       setActiveTabId(tab.id);
       setError("");
+      appendLog(
+        "info",
+        "terminal",
+        `file dropped on terminal, title=${tab.title}, file=${baseName(path)}`,
+      );
       if (!tab.sessionId) {
         setError("SSH 연결 후 터미널에 파일을 드래그하세요.");
         return;
@@ -730,11 +910,18 @@ export function HomePage() {
         setRemoteUploadPath(workingDirectory || "/");
         setUploadTransferMode("sftp");
         setUploadPath(path);
+        appendLog(
+          "info",
+          "sftp",
+          `upload prompt opened, title=${tab.title}, remoteDirectory=${workingDirectory || "/"}`,
+        );
       } catch (err: unknown) {
-        setError(errorMessage(err));
+        const message = errorMessage(err);
+        appendLog("error", "sftp", `failed to resolve upload directory: ${message}`);
+        setError(message);
       }
     },
-    [],
+    [appendLog],
   );
 
   const openRemoteDownload = useCallback(
@@ -743,9 +930,15 @@ export function HomePage() {
       setError("");
       if (!tab.sessionId) {
         setError("연결된 터미널 탭에서만 가져오기를 사용할 수 있습니다.");
+        appendLog("warn", "sftp", "remote download skipped, no active SSH session");
         return;
       }
       try {
+        appendLog(
+          "info",
+          "sftp",
+          `remote download dialog requested, title=${tab.title}`,
+        );
         const [workingDirectory, localDirectory] = await Promise.all([
           getSSHWorkingDirectory(tab.sessionId),
           defaultLocalDirectory(),
@@ -773,6 +966,11 @@ export function HomePage() {
               : current,
           );
           setStatus("현재 터미널 계정 기준으로 원격 목록을 표시합니다.");
+          appendLog(
+            "info",
+            "sftp",
+            `terminal remote list loaded, path=${remotePath}, count=${entries.length}`,
+          );
           return;
         }
 
@@ -806,6 +1004,11 @@ export function HomePage() {
               ? { ...current, entries, loading: false }
               : current,
           );
+          appendLog(
+            "info",
+            "sftp",
+            `sftp remote list loaded, path=${remotePath}, count=${entries.length}`,
+          );
         } catch (sftpErr: unknown) {
           if (sessionId) {
             closeSFTPSession(sessionId).catch(() => undefined);
@@ -831,12 +1034,19 @@ export function HomePage() {
               : current,
           );
           setStatus(`SFTP 실패로 터미널 계정 기준 목록을 표시합니다: ${errorMessage(sftpErr)}`);
+          appendLog(
+            "warn",
+            "sftp",
+            `sftp remote list failed, terminal list loaded, path=${remotePath}, count=${entries.length}: ${errorMessage(sftpErr)}`,
+          );
         }
       } catch (err: unknown) {
-        setError(errorMessage(err));
+        const message = errorMessage(err);
+        appendLog("error", "sftp", `remote download dialog failed: ${message}`);
+        setError(message);
       }
     },
-    [],
+    [appendLog],
   );
 
   const closeRemoteDownload = useCallback(() => {
@@ -858,7 +1068,7 @@ export function HomePage() {
         selectedPaths: new Set(),
       });
       try {
-        const entries =
+      const entries =
           remoteDownload.mode === "terminal"
             ? await listRemoteDirectoryViaTerminal(
                 remoteDownload.sessionId,
@@ -872,9 +1082,14 @@ export function HomePage() {
                 entries,
                 loading: false,
                 remotePath,
-                selectedPaths: new Set(),
-              }
+              selectedPaths: new Set(),
+            }
             : current,
+        );
+        appendLog(
+          "info",
+          "sftp",
+          `remote directory loaded, mode=${remoteDownload.mode}, path=${remotePath}, count=${entries.length}`,
         );
       } catch (err: unknown) {
         setRemoteDownload((current) =>
@@ -882,10 +1097,16 @@ export function HomePage() {
             ? { ...current, loading: false }
             : current,
         );
-        setError(errorMessage(err));
+        const message = errorMessage(err);
+        appendLog(
+          "error",
+          "sftp",
+          `remote directory load failed, mode=${remoteDownload.mode}, path=${remotePath}: ${message}`,
+        );
+        setError(message);
       }
     },
-    [remoteDownload],
+    [appendLog, remoteDownload],
   );
 
   const downloadSelectedRemoteFiles = useCallback(async () => {
@@ -894,6 +1115,11 @@ export function HomePage() {
     }
     setError("");
     try {
+      appendLog(
+        "info",
+        "sftp",
+        `download requested, mode=${remoteDownload.mode}, count=${remoteDownload.selectedPaths.size}, localDirectory=${remoteDownload.localDirectory}`,
+      );
       const transfers = await Promise.all(
         Array.from(remoteDownload.selectedPaths).map(async (remotePath) => {
           if (remoteDownload.mode === "terminal") {
@@ -921,6 +1147,11 @@ export function HomePage() {
             setStatus(
               `SFTP 실패로 터미널 계정 기준 다운로드 중: ${errorMessage(sftpErr)}`,
             );
+            appendLog(
+              "warn",
+              "sftp",
+              `download fallback to terminal, remote=${remotePath}: ${errorMessage(sftpErr)}`,
+            );
             return downloadFileViaTerminal({
               sshSessionId: tab.sessionId,
               localPath: remoteDownload.localDirectory,
@@ -944,11 +1175,18 @@ export function HomePage() {
         for (const transferId of transferIds) {
           downloadTransferBatchRef.current.set(transferId, batchId);
         }
+        appendLog(
+          "info",
+          "sftp",
+          `download transfers started, count=${transferIds.length}`,
+        );
       }
     } catch (err: unknown) {
-      setError(errorMessage(err));
+      const message = errorMessage(err);
+      appendLog("error", "sftp", `download failed: ${message}`);
+      setError(message);
     }
-  }, [remoteDownload]);
+  }, [appendLog, remoteDownload]);
 
   const browseDownloadDirectory = useCallback(async () => {
     if (!remoteDownload) {
@@ -962,10 +1200,13 @@ export function HomePage() {
       setRemoteDownload((current) =>
         current ? { ...current, localDirectory: selected } : current,
       );
+      appendLog("info", "sftp", `download local directory selected: ${selected}`);
     } catch (err: unknown) {
-      setError(errorMessage(err));
+      const message = errorMessage(err);
+      appendLog("error", "sftp", `download local directory selection failed: ${message}`);
+      setError(message);
     }
-  }, [remoteDownload]);
+  }, [appendLog, remoteDownload]);
 
   const handleAppFontWheel = useCallback((event: WheelEvent<HTMLElement>) => {
     if (!event.ctrlKey) {
@@ -1196,6 +1437,13 @@ export function HomePage() {
             >
               터널
             </button>
+            <button
+              type="button"
+              className={activeView === "log" ? "tab-button active" : "tab-button"}
+              onClick={() => setActiveView("log")}
+            >
+              로그
+            </button>
           </div>
           <div className="workspace-help-group">
             <button
@@ -1289,6 +1537,11 @@ export function HomePage() {
                   onData={(data) => sendInput(tab, data)}
                   onContextMenu={(x, y, selection) => {
                     activateTerminalTab(tab);
+                    appendLog(
+                      "info",
+                      "terminal",
+                      `context menu opened, title=${tab.title}, selectionLength=${selection.length}`,
+                    );
                     setTerminalMenu({
                       selection,
                       tabId: tab.id,
@@ -1297,6 +1550,9 @@ export function HomePage() {
                     });
                   }}
                   onCopy={copyTerminalSelection}
+                  onDiagnostic={(message) =>
+                    appendLog("info", "terminal", `${tab.title}: ${message}`)
+                  }
                   onFileDrop={(path) => handleTerminalFileDrop(tab, path)}
                   onPaste={() => pasteClipboardToTab(tab)}
                   onZoom={handleTerminalFontWheel}
@@ -1318,6 +1574,18 @@ export function HomePage() {
             profile={profile}
             password={password}
             passphrase={passphrase}
+          />
+        </div>
+        <div
+          className={
+            activeView === "log" ? "view-pane active" : "view-pane hidden"
+          }
+        >
+          <LogPanel
+            logs={logs}
+            onClear={() => setLogs([])}
+            onCopy={copyLogs}
+            onReveal={revealLogs}
           />
         </div>
       </section>
@@ -1533,6 +1801,59 @@ export function HomePage() {
   );
 }
 
+function LogPanel({
+  logs,
+  onClear,
+  onCopy,
+  onReveal,
+}: {
+  logs: AppLogEntry[];
+  onClear: () => void;
+  onCopy: () => void;
+  onReveal: () => void;
+}) {
+  return (
+    <section className="log-panel">
+      <header className="log-toolbar">
+        <div>
+          <h2>동작 로그</h2>
+          <p>
+            SSH, SFTP, 터널, 클립보드 이벤트를 표시하고 날짜별 파일에도 저장합니다.
+          </p>
+        </div>
+        <div className="log-actions">
+          <button type="button" className="secondary-button" onClick={onCopy}>
+            로그 복사
+          </button>
+          <button type="button" className="secondary-button" onClick={onReveal}>
+            탐색기 열기
+          </button>
+          <button type="button" className="secondary-button" onClick={onClear}>
+            지우기
+          </button>
+        </div>
+      </header>
+      <div className="log-list">
+        {logs.length === 0 ? (
+          <div className="empty-state">아직 로그가 없습니다.</div>
+        ) : (
+          logs
+            .slice()
+            .reverse()
+            .map((entry) => (
+              <article key={entry.id} className={`log-row ${entry.level}`}>
+                <span>{entry.at}</span>
+                <strong>{entry.source}</strong>
+                <em>{entry.level}</em>
+                <p>{entry.message}</p>
+              </article>
+            ))
+        )}
+      </div>
+    </section>
+  );
+}
+
 function tabTitle(profile: ConnectionProfile): string {
   const name = profile.name.trim();
   if (name && name !== "수동 접속") {
@@ -1558,6 +1879,29 @@ function errorMessage(err: unknown): string {
     return err.message;
   }
   return String(err);
+}
+
+function formatLogTimestamp(date: Date): string {
+  const pad = (value: number) => value.toString().padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(
+    date.getDate(),
+  )} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(
+    date.getSeconds(),
+  )}`;
+}
+
+function formatLogEntries(logs: AppLogEntry[]): string {
+  return logs.map(formatLogEntry).join("\n");
+}
+
+function formatLogEntry(entry: AppLogEntry): string {
+  return `[${entry.at}] ${entry.level.toUpperCase()} ${entry.source}: ${entry.message}`;
+}
+
+function sanitizeLogMessage(message: string): string {
+  return message
+    .replace(/(password|passphrase|token|secret)=([^,\s]+)/gi, "$1=***")
+    .replace(/(password|passphrase|token|secret):\s*([^,\s]+)/gi, "$1: ***");
 }
 
 function baseName(path: string): string {

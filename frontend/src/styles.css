@@ -726,6 +726,115 @@ body.panel-resizing {
   background: transparent;
 }
 
+.log-panel {
+  background: var(--app-bg);
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+  padding: 16px;
+}
+
+.log-toolbar {
+  align-items: center;
+  border: 1px solid var(--panel-border);
+  border-radius: 8px;
+  background: var(--panel-bg);
+  display: flex;
+  gap: 12px;
+  justify-content: space-between;
+  padding: 14px;
+}
+
+.log-toolbar h2,
+.log-toolbar p {
+  margin: 0;
+}
+
+.log-toolbar h2 {
+  font-size: 18px;
+}
+
+.log-toolbar p {
+  color: var(--text-muted);
+  font-size: 13px;
+  margin-top: 5px;
+}
+
+.log-actions {
+  display: flex;
+  flex: 0 0 auto;
+  gap: 8px;
+}
+
+.log-list {
+  border: 1px solid var(--panel-border);
+  border-radius: 8px;
+  background: var(--panel-bg);
+  flex: 1;
+  margin-top: 12px;
+  min-height: 0;
+  overflow: auto;
+}
+
+.log-row {
+  align-items: start;
+  border-bottom: 1px solid var(--panel-border);
+  display: grid;
+  gap: 10px;
+  grid-template-columns: 150px 78px 58px minmax(0, 1fr);
+  padding: 9px 12px;
+}
+
+.log-row:last-child {
+  border-bottom: 0;
+}
+
+.log-row span,
+.log-row strong,
+.log-row em,
+.log-row p {
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.log-row span {
+  color: var(--text-muted);
+  font-family: Consolas, "Cascadia Mono", monospace;
+}
+
+.log-row strong {
+  color: var(--button-primary);
+  font-weight: 700;
+}
+
+.log-row em {
+  border-radius: 999px;
+  background: #eef4ff;
+  color: #2459bd;
+  font-style: normal;
+  justify-self: start;
+  padding: 1px 7px;
+}
+
+.log-row.warn em {
+  background: #fff3bf;
+  color: #7a5300;
+}
+
+.log-row.error em {
+  background: #ffe0e0;
+  color: #a02525;
+}
+
+.log-row p {
+  color: var(--text-primary);
+  margin: 0;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
 .sftp-panel {
   display: flex;
   flex: 1;
