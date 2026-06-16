@@ -1,6 +1,7 @@
 package app
 
 import (
+	"bytes"
 	"strings"
 	"testing"
 )
@@ -156,5 +157,36 @@ func TestExtractBase64PayloadSkipsPromptAndEcho(t *testing.T) {
 func TestExtractBase64PayloadRejectsMissingMarker(t *testing.T) {
 	if _, err := extractBase64Payload("SGVsbG8=", "start", "end"); err == nil {
 		t.Fatal("expected marker error")
+	}
+}
+
+func TestTerminalUploadBase64LineFitsPTYCanonicalInput(t *testing.T) {
+	data := bytes.Repeat([]byte{0xff}, terminalUploadRawChunkSize)
+	line := terminalUploadBase64Line(data)
+	if !strings.HasSuffix(line, "\n") {
+		t.Fatal("line must end with newline")
+	}
+	encoded := strings.TrimSuffix(line, "\n")
+	if len(encoded) > 1024 {
+		t.Fatalf("encoded line length = %d, want <= 1024", len(encoded))
+	}
+}
+
+func TestTerminalUploadSuffixChecksRemoteFileSize(t *testing.T) {
+	suffix := terminalUploadSuffix("__DATA__", "__END__", 123)
+	required := []string{
+		"wc -c",
+		"tr -d '[:space:]'",
+		"remote file size mismatch",
+		"want %s",
+		"'123'",
+	}
+	for _, part := range required {
+		if !strings.Contains(suffix, part) {
+			t.Fatalf("suffix does not contain %q:\n%s", part, suffix)
+		}
+	}
+	if strings.Contains(suffix, "want '123'") {
+		t.Fatalf("suffix embeds quoted size inside printf format:\n%s", suffix)
 	}
 }

@@ -32,3 +32,11 @@ func TestCleanRemotePath(t *testing.T) {
 		})
 	}
 }
+
+func TestRemoteUploadTempPathUsesSameDirectoryAndSafeName(t *testing.T) {
+	got := remoteUploadTempPath("/home/dev/file.zip", "session:id")
+	want := "/home/dev/.file.zip.lightssh-upload-session-id.tmp"
+	if got != want {
+		t.Fatalf("temp path = %q, want %q", got, want)
+	}
+}

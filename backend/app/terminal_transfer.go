@@ -35,6 +35,7 @@ type terminalCommandResult struct {
 const terminalEntryPrefix = "__LIGHTSSH_ENTRY__\t"
 const terminalSizePrefix = "__LIGHTSSH_SIZE__\t"
 const terminalUserPrefix = "__LIGHTSSH_USER__\t"
+const terminalUploadRawChunkSize = 768
 
 func (a *App) GetSSHRemoteUser(sessionID string) (string, error) {
 	output, err := a.runTerminalCommand(sessionID, "user=$(id -un 2>/dev/null || whoami 2>/dev/null)\nprintf '__LIGHTSSH_USER__\\t%s\\n' \"$user\"", 3*time.Second, 8192)
@@ -259,7 +260,7 @@ func (a *App) uploadFileViaTerminal(sessionID string, transferID string, localPa
 	}
 
 	written, writeErr := a.writeBase64FileToTerminal(sessionID, transferID, localPath, remotePath, total)
-	suffix := fmt.Sprintf("\n%s\ncode=$?\nif [ \"$code\" -ne 0 ]; then printf 'ERROR\\tbase64 decode failed: %%s\\n' \"$code\"; fi\nfi\n%s\r", dataMarker, terminalCommandEpilogue(endMarker))
+	suffix := terminalUploadSuffix(dataMarker, endMarker, total)
 	if err := a.sshManager.Write(sessionID, suffix); writeErr == nil {
 		writeErr = err
 	}
@@ -289,13 +290,13 @@ func (a *App) writeBase64FileToTerminal(sessionID string, transferID string, loc
 	}
 	defer file.Close()
 
-	buffer := make([]byte, 48*1024)
+	buffer := make([]byte, terminalUploadRawChunkSize)
 	var written int64
 	var lastEmit int64
 	for {
 		n, readErr := file.Read(buffer)
 		if n > 0 {
-			chunk := base64.StdEncoding.EncodeToString(buffer[:n]) + "\n"
+			chunk := terminalUploadBase64Line(buffer[:n])
 			if err := a.sshManager.Write(sessionID, chunk); err != nil {
 				return written, err
 			}
@@ -312,6 +313,15 @@ func (a *App) writeBase64FileToTerminal(sessionID string, transferID string, loc
 			return written, readErr
 		}
 	}
+}
+
+func terminalUploadBase64Line(data []byte) string {
+	return base64.StdEncoding.EncodeToString(data) + "\n"
+}
+
+func terminalUploadSuffix(dataMarker string, endMarker string, total int64) string {
+	expectedSize := shellQuote(fmt.Sprintf("%d", total))
+	return fmt.Sprintf("\n%s\ncode=$?\nif [ \"$code\" -ne 0 ]; then printf 'ERROR\\tbase64 decode failed: %%s\\n' \"$code\"; else size=$(wc -c < \"$remote\" 2>/dev/null | tr -d '[:space:]'); if [ -z \"$size\" ]; then size=-1; fi; if [ \"$size\" != %s ]; then printf 'ERROR\\tremote file size mismatch: got %%s want %%s\\n' \"$size\" %s; fi; fi\nfi\n%s\r", dataMarker, expectedSize, expectedSize, terminalCommandEpilogue(endMarker))
 }
 
 func (a *App) remoteFileSizeViaTerminal(sessionID string, remotePath string) (int64, error) {

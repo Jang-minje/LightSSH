@@ -188,6 +188,24 @@ export function HomePage() {
     [activeTabId, terminalTabs],
   );
 
+  const visibleTransfer = useMemo(() => {
+    const list = Object.values(transfers);
+    if (list.length === 0) {
+      return null;
+    }
+    return (
+      list
+        .slice()
+        .reverse()
+        .find((transfer) => !isFinishedTransfer(transfer.status)) ??
+      list[list.length - 1]
+    );
+  }, [transfers]);
+
+  const visibleTransferMetrics = visibleTransfer
+    ? transferMetrics[visibleTransfer.transferId]
+    : undefined;
+
   const appendLog = useCallback(
     (
       level: AppLogEntry["level"],
@@ -720,6 +738,7 @@ export function HomePage() {
       }
       await sendSSHInput(tab.sessionId, normalizeTerminalPaste(text));
       setTerminalFocusKey((current) => current + 1);
+      setStatus("클립보드 붙여넣기 전송됨");
       appendLog(
         "info",
         "clipboard",
@@ -1392,7 +1411,6 @@ export function HomePage() {
           <button type="button" className="secondary-button" onClick={saveCurrentProfile}>
             프로필 저장
           </button>
-          {error ? <div className="error-box">{error}</div> : null}
         </div>
       </aside>
       <div
@@ -1623,41 +1641,14 @@ export function HomePage() {
             ))
           )}
         </div>
-        {Object.values(transfers).length > 0 ? (
-          <div className="transfer-panel">
-            <h3>전송</h3>
-            {Object.values(transfers)
-              .slice(-5)
-              .map((transfer) => (
-                <div key={transfer.transferId} className="transfer-compact-row">
-                  <div className="transfer-compact-title">
-                    <strong>{transferFileName(transfer)}</strong>
-                    <span>{transferDirectionLabel(transfer)}</span>
-                  </div>
-                  <progress
-                    value={transfer.total > 0 ? transfer.bytes : transferPercent(transfer)}
-                    max={transfer.total > 0 ? transfer.total : 100}
-                  />
-                  <div className="transfer-compact-meta">
-                    <span>{transferStatusLabel(transfer.status)}</span>
-                    <span>{transferPercent(transfer)}%</span>
-                  </div>
-                  <div className="transfer-speed-row">
-                    <span>
-                      현재 {formatSpeed(transferMetrics[transfer.transferId]?.speedBytesPerSecond ?? 0)}
-                    </span>
-                    <span>
-                      평균 {formatSpeed(transferMetrics[transfer.transferId]?.averageBytesPerSecond ?? 0)}
-                    </span>
-                  </div>
-                  <div className="transfer-size-row">
-                    {formatBytes(transfer.bytes)} / {formatBytes(transfer.total)}
-                  </div>
-                </div>
-              ))}
-          </div>
-        ) : null}
       </aside>
+      <BottomStatusBar
+        status={status}
+        error={error}
+        transfer={visibleTransfer}
+        metrics={visibleTransferMetrics}
+        onClearError={() => setError("")}
+      />
       <HostKeyModal
         prompt={hostKeyPrompt}
         onDecision={async (accept) => {
@@ -1851,6 +1842,82 @@ function LogPanel({
         )}
       </div>
     </section>
+  );
+}
+
+function BottomStatusBar({
+  status,
+  error,
+  transfer,
+  metrics,
+  onClearError,
+}: {
+  status: string;
+  error: string;
+  transfer: TransferProgressEvent | null;
+  metrics?: TransferMetrics;
+  onClearError: () => void;
+}) {
+  const message = error || status || "대기";
+  const percent = transfer ? transferPercent(transfer) : 0;
+  const progressValue = transfer
+    ? transfer.total > 0
+      ? transfer.bytes
+      : percent
+    : 0;
+  const progressMax = transfer?.total && transfer.total > 0 ? transfer.total : 100;
+
+  return (
+    <footer className={error ? "bottom-status-bar error" : "bottom-status-bar"}>
+      <div className="bottom-status-main" title={message}>
+        <span
+          className={
+            error
+              ? "bottom-status-indicator error"
+              : transfer
+                ? `bottom-status-indicator ${transfer.status}`
+                : "bottom-status-indicator idle"
+          }
+          aria-hidden="true"
+        />
+        <strong>{error ? "오류" : "상태"}</strong>
+        <span className="bottom-status-message">{message}</span>
+        {error ? (
+          <button
+            type="button"
+            className="bottom-status-clear"
+            onClick={onClearError}
+          >
+            닫기
+          </button>
+        ) : null}
+      </div>
+      {transfer ? (
+        <div
+          className="bottom-transfer"
+          title={`${transferFileName(transfer)} ${transferDirectionLabel(
+            transfer,
+          )} ${transferStatusLabel(transfer.status)}`}
+        >
+          <div className="bottom-transfer-title">
+            <strong>{transferFileName(transfer)}</strong>
+            <span>{transferDirectionLabel(transfer)}</span>
+            <em>{transferStatusLabel(transfer.status)}</em>
+          </div>
+          <progress value={progressValue} max={progressMax} />
+          <span className="bottom-transfer-percent">{percent}%</span>
+          <span className="bottom-transfer-size">
+            {formatBytes(transfer.bytes)} / {formatBytes(transfer.total)}
+          </span>
+          <span className="bottom-transfer-speed">
+            현재 {formatSpeed(metrics?.speedBytesPerSecond ?? 0)} · 평균{" "}
+            {formatSpeed(metrics?.averageBytesPerSecond ?? 0)}
+          </span>
+        </div>
+      ) : (
+        <div className="bottom-transfer empty">전송 없음</div>
+      )}
+    </footer>
   );
 }
 

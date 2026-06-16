@@ -15,7 +15,7 @@ import (
 	"sync"
 	"time"
 
-	sftp "github.com/pkg/sftp/v2"
+	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -53,7 +53,7 @@ func (m *Manager) Start(ctx context.Context, request ConnectRequest) (SessionInf
 		return SessionInfo{}, fmt.Errorf("connect ssh for sftp: %w", err)
 	}
 
-	client, err := sftp.NewClient(ctx, sshClient)
+	client, err := sftp.NewClient(sshClient)
 	if err != nil {
 		_ = sshClient.Close()
 		return SessionInfo{}, fmt.Errorf("create sftp client: %w", err)
@@ -137,17 +137,13 @@ func (m *Manager) ListRemote(sessionID string, remotePath string) ([]RemoteEntry
 
 	result := make([]RemoteEntry, 0, len(entries))
 	for _, entry := range entries {
-		info, err := entry.Info()
-		if err != nil {
-			return nil, fmt.Errorf("read remote entry info: %w", err)
-		}
 		result = append(result, RemoteEntry{
 			Name:    entry.Name(),
 			Path:    path.Join(cleanPath, entry.Name()),
 			IsDir:   entry.IsDir(),
-			Size:    info.Size(),
-			Mode:    info.Mode().String(),
-			ModTime: info.ModTime().Format(time.RFC3339),
+			Size:    entry.Size(),
+			Mode:    entry.Mode().String(),
+			ModTime: entry.ModTime().Format(time.RFC3339),
 		})
 	}
 	sort.Slice(result, func(i, j int) bool {
@@ -204,7 +200,7 @@ func (m *Manager) Mkdir(sessionID string, remotePath string) error {
 	if err != nil {
 		return err
 	}
-	return session.client.Mkdir(cleanPath, 0o755)
+	return session.client.Mkdir(cleanPath)
 }
 
 func (m *Manager) Rename(sessionID string, oldPath string, newPath string) error {
@@ -379,12 +375,21 @@ func (m *Manager) upload(ctx context.Context, cancel context.CancelFunc, transfe
 	}
 	defer source.Close()
 
-	target, err := client.OpenFile(remotePath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	tempPath := remoteUploadTempPath(remotePath, transferID)
+	_ = client.Remove(tempPath)
+	defer func() {
+		_ = client.Remove(tempPath)
+	}()
+	target, err := client.OpenFile(tempPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC)
 	if err != nil {
 		m.emitFailure(ctx, transferID, sessionID, "upload", localPath, remotePath, total, 0, err)
 		return
 	}
-	defer target.Close()
+	defer func() {
+		if target != nil {
+			_ = target.Close()
+		}
+	}()
 
 	written, err := copyWithProgress(ctx, source, target, total, func(bytes int64) {
 		m.emit(ProgressEvent{TransferID: transferID, SessionID: sessionID, Direction: "upload", LocalPath: localPath, RemotePath: remotePath, Bytes: bytes, Total: total, Status: "in_progress"})
@@ -393,7 +398,59 @@ func (m *Manager) upload(ctx context.Context, cancel context.CancelFunc, transfe
 		m.emitFailure(ctx, transferID, sessionID, "upload", localPath, remotePath, total, written, err)
 		return
 	}
+	if err := target.Close(); err != nil {
+		m.emitFailure(ctx, transferID, sessionID, "upload", localPath, remotePath, total, written, err)
+		return
+	}
+	target = nil
+	remoteInfo, err := client.Stat(tempPath)
+	if err != nil {
+		m.emitFailure(ctx, transferID, sessionID, "upload", localPath, remotePath, total, written, err)
+		return
+	}
+	if remoteInfo.Size() != written {
+		m.emitFailure(ctx, transferID, sessionID, "upload", localPath, remotePath, total, written, fmt.Errorf("remote file size mismatch: got %d want %d", remoteInfo.Size(), written))
+		return
+	}
+	if err := replaceRemoteUploadTarget(client, tempPath, remotePath); err != nil {
+		m.emitFailure(ctx, transferID, sessionID, "upload", localPath, remotePath, total, written, err)
+		return
+	}
 	m.emit(ProgressEvent{TransferID: transferID, SessionID: sessionID, Direction: "upload", LocalPath: localPath, RemotePath: remotePath, Bytes: written, Total: total, Status: "completed"})
+}
+
+func replaceRemoteUploadTarget(client *sftp.Client, tempPath string, remotePath string) error {
+	info, err := client.Stat(remotePath)
+	if err == nil && info.IsDir() {
+		return fmt.Errorf("remote path is a directory: %s", remotePath)
+	}
+	if err == nil {
+		if err := client.Remove(remotePath); err != nil {
+			return fmt.Errorf("remove existing remote file before replace: %w", err)
+		}
+	}
+	if err := client.Rename(tempPath, remotePath); err != nil {
+		return fmt.Errorf("replace remote file: %w", err)
+	}
+	return nil
+}
+
+func remoteUploadTempPath(remotePath string, transferID string) string {
+	directory := path.Dir(remotePath)
+	name := path.Base(remotePath)
+	safeID := strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z':
+			return r
+		case r >= 'A' && r <= 'Z':
+			return r
+		case r >= '0' && r <= '9':
+			return r
+		default:
+			return '-'
+		}
+	}, transferID)
+	return path.Join(directory, "."+name+".lightssh-upload-"+safeID+".tmp")
 }
 
 func (m *Manager) download(ctx context.Context, cancel context.CancelFunc, transferID string, sessionID string, localPath string, remotePath string, total int64, client *sftp.Client) {
